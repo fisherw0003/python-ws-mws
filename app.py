@@ -58,6 +58,14 @@ def _get_proxy():
 
 PROXY_HOST, PROXY_PORT = _get_proxy()
 
+def _set_nodelay(writer):
+    try:
+        sock = writer.get_extra_info('socket')
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except:
+        pass
+
 async def open_outbound_connection(host, port, timeout=15):
     """尝试通过 HTTP 代理 CONNECT 出站，失败则直连"""
     if PROXY_HOST and PROXY_PORT:
@@ -72,6 +80,7 @@ async def open_outbound_connection(host, port, timeout=15):
             resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
             if b" 200 " in resp.split(b"\r\n")[0]:
                 logger.info(f"Proxy CONNECT {host}:{port} OK")
+                _set_nodelay(writer)
                 return reader, writer
             else:
                 logger.warning(f"Proxy CONNECT {host}:{port} rejected: {resp[:60]}")
@@ -182,12 +191,25 @@ async def get_ip():
         Tls = 'tls'
         CurrentPort = 443
 
+# DNS cache: host -> (ip, expiry)
+_DNS_CACHE = {}
+_DNS_TTL = 60
+
 async def resolve_host(host: str) -> str:
     try:
         ipaddress.ip_address(host)
         return host
     except:
         pass
+
+    # Check cache
+    import time as _time
+    now = _time.time()
+    if host in _DNS_CACHE:
+        ip, exp = _DNS_CACHE[host]
+        if now < exp:
+            return ip
+        del _DNS_CACHE[host]
 
     # Method 1: system DNS (works if container has DNS)
     try:
@@ -197,6 +219,7 @@ async def resolve_host(host: str) -> str:
             timeout=5)
         if infos:
             ip = infos[0][4][0]
+            _DNS_CACHE[host] = (ip, now + _DNS_TTL)
             logger.info(f"DNS system: {host} -> {ip}")
             return ip
     except Exception as e:
@@ -220,6 +243,7 @@ async def resolve_host(host: str) -> str:
                 for answer in data['Answer']:
                     if answer.get('type') == 1:
                         ip = answer.get('data')
+                        _DNS_CACHE[host] = (ip, now + _DNS_TTL)
                         logger.info(f"DNS DoH-via-proxy: {host} -> {ip}")
                         return ip
         except Exception as e:
